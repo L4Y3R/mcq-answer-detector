@@ -4,11 +4,13 @@ import os
 import shutil
 from configs.logger import setup_logger
 from detector.processor import MCQAnswerDetector
+from detector.processorv2 import MCQAnswerDetectorV2
 from exceptions.exceptions import MCQDetectorError
 
 router = APIRouter()
 logger = setup_logger()
 processor = MCQAnswerDetector(logger)
+processor2 = MCQAnswerDetectorV2(logger)
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -51,6 +53,10 @@ async def analyze_image(file: UploadFile = File(...)):
     except Exception as e:
         logger.exception("Unexpected error occurred.")
         return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+@router.post("/v2/analyze")
+async def analyze_image():
+    processor2.process_image("test.jpg")
     
 @router.delete("/clear-uploads")
 async def clear_uploads():
