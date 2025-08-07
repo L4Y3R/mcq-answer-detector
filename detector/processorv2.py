@@ -20,11 +20,15 @@ class MCQAnswerDetectorV2:
         self.cols = Config.COLS
         self.options = Config.OPTIONS
 
-        # Improved parameters
-        self.min_contour_area = 50
-        self.max_contour_area = 2000
-        self.circularity_threshold = 0.3
-        self.fill_threshold = 0.15  # Percentage of circle that needs to be filled
+        # Optimized parameters for the specific answer sheet format
+        self.min_contour_area = 80
+        self.max_contour_area = 3000
+        self.circularity_threshold = 0.4
+        self.fill_threshold = 0.20
+
+        # Grey/black detection parameters
+        self.dark_intensity_threshold = 160  # Values below this are considered dark
+        self.dark_pixel_ratio_threshold = 0.15  # Minimum ratio of dark pixels to consider filled
 
     def preprocess_image(self, image_path):
         try:
@@ -37,256 +41,293 @@ class MCQAnswerDetectorV2:
                 self.logger.error("Failed to read image.")
                 raise ImageProcessingError("Could not decode image.")
 
-            # Improve image quality
+            # Resize if image is too large (for consistent processing)
+            height, width = image.shape[:2]
+            if width > 2000 or height > 2000:
+                scale_factor = min(2000 / width, 2000 / height)
+                new_width = int(width * scale_factor)
+                new_height = int(height * scale_factor)
+                image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+            # Convert to grayscale
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            # Enhanced preprocessing
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(gray)
 
-            # Denoise
-            denoised = cv2.fastNlMeansDenoising(enhanced)
+            # Bilateral filter to reduce noise while keeping edges sharp
+            denoised = cv2.bilateralFilter(enhanced, 9, 75, 75)
 
-            # Light blur to smooth noise
-            blurred = cv2.GaussianBlur(denoised, (3, 3), 0)
-
-            debug_path = f"{Config.LOG_DIR}/debug_preprocessed.png"
-            cv2.imwrite(debug_path, blurred)
+            debug_path = f"{Config.LOG_DIR}/debug_preprocessed_v3.png"
+            cv2.imwrite(debug_path, denoised)
             self.logger.info(f"Preprocessed image saved at {debug_path}.")
 
-            return image, gray, blurred
+            return image, gray, denoised, None  # No longer returning HSV image
 
         except Exception as e:
             self.logger.exception("Error during image preprocessing.")
             raise ImageProcessingError(str(e))
 
-    def detect_grid_automatically(self, gray_image):
-        """Automatically detect the grid region using contour detection"""
+    def detect_dark_regions(self, gray_image):
+        """Detect dark-filled bubbles using intensity thresholding"""
+        # Create mask for dark regions
+        _, dark_mask = cv2.threshold(gray_image, self.dark_intensity_threshold, 255, cv2.THRESH_BINARY_INV)
+
+        # Morphological operations to clean up the mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel)
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, kernel)
+
+        debug_path = f"{Config.LOG_DIR}/debug_dark_mask.png"
+        cv2.imwrite(debug_path, dark_mask)
+
+        return dark_mask
+
+    def detect_grid_region_precise(self, gray_image, original_image):
+        """More precise grid detection using contours and layout analysis"""
         try:
             # Apply adaptive thresholding
             binary = cv2.adaptiveThreshold(
                 gray_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV, 11, 2
+                cv2.THRESH_BINARY_INV, 15, 3
             )
 
             # Find contours
             contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            # Find the largest rectangular contour (likely the answer grid)
-            largest_area = 0
+            # Look for the main grid border
+            h, w = gray_image.shape
+            min_area = (h * w) * 0.15  # At least 15% of image
+            max_area = (h * w) * 0.8  # At most 80% of image
+
             best_rect = None
+            best_score = 0
 
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if area > largest_area:
-                    # Approximate the contour
-                    epsilon = 0.02 * cv2.arcLength(contour, True)
-                    approx = cv2.approxPolyDP(contour, epsilon, True)
+                if min_area < area < max_area:
+                    # Get bounding rectangle
+                    x, y, w_rect, h_rect = cv2.boundingRect(contour)
+                    aspect_ratio = w_rect / h_rect
 
-                    # If it's roughly rectangular and large enough
-                    if len(approx) >= 4 and area > gray_image.shape[0] * gray_image.shape[1] * 0.1:
-                        x, y, w, h = cv2.boundingRect(contour)
-                        aspect_ratio = w / h
+                    # Score based on area, aspect ratio, and position
+                    area_score = min(area / (h * w * 0.5), 1.0)  # Normalize to max 1.0
+                    aspect_score = 1.0 if 1.2 < aspect_ratio < 2.0 else 0.5
+                    position_score = 1.0 if y > h * 0.1 and y < h * 0.4 else 0.7  # Should be in upper-middle
 
-                        # Check if it looks like our answer grid (wider than tall)
-                        if 0.8 < aspect_ratio < 2.5:
-                            largest_area = area
-                            best_rect = (x, y, w, h)
+                    total_score = area_score * aspect_score * position_score
+
+                    if total_score > best_score:
+                        best_score = total_score
+                        best_rect = (x, y, w_rect, h_rect)
 
             if best_rect:
-                x, y, w, h = best_rect
-                # Add some padding
-                padding = 10
-                x = max(0, x - padding)
-                y = max(0, y - padding)
-                w = min(gray_image.shape[1] - x, w + 2 * padding)
-                h = min(gray_image.shape[0] - y, h + 2 * padding)
+                x, y, w_rect, h_rect = best_rect
+                # Fine-tune the boundaries by looking for grid lines
+                grid_region = gray_image[y:y + h_rect, x:x + w_rect]
 
-                self.logger.info(f"Auto-detected grid: x={x}, y={y}, w={w}, h={h}")
-                return gray_image[y:y + h, x:x + w]
+                self.logger.info(f"Detected grid region: x={x}, y={y}, w={w_rect}, h={h_rect}")
+                debug_path = f"{Config.LOG_DIR}/debug_detected_grid.png"
+                cv2.imwrite(debug_path, grid_region)
+
+                return grid_region, (x, y, w_rect, h_rect)
             else:
-                # Fall back to manual cropping if auto-detection fails
-                return self.get_grid_region_manual(gray_image)
+                # Fallback to manual estimation based on typical answer sheet layout
+                return self.get_grid_region_manual_v3(gray_image)
 
         except Exception as e:
-            self.logger.warning(f"Auto grid detection failed: {e}, falling back to manual")
-            return self.get_grid_region_manual(gray_image)
+            self.logger.warning(f"Grid detection failed: {e}")
+            return self.get_grid_region_manual_v3(gray_image)
 
-    def get_grid_region_manual(self, gray_image):
-        """Manual grid cropping as fallback"""
+    def get_grid_region_manual_v3(self, gray_image):
+        """Improved manual grid extraction based on answer sheet analysis"""
         try:
             h, w = gray_image.shape
-            top, bottom = int(h * 0.25), int(h * 0.95)
-            left, right = int(w * 0.06), int(w * 0.985)
-            cropped = gray_image[top:bottom, left:right]
 
-            self.logger.info(f"Manual cropped grid: top={top}, bottom={bottom}, left={left}, right={right}")
-            return cropped
+            # Based on the answer sheet image, the grid appears to be roughly:
+            # - Top: around 25-30% from top
+            # - Bottom: around 85-90% from top
+            # - Left: around 5-8% from left
+            # - Right: around 92-95% from left
+
+            top = int(h * 0.28)
+            bottom = int(h * 0.87)
+            left = int(w * 0.06)
+            right = int(w * 0.94)
+
+            cropped = gray_image[top:bottom, left:right]
+            bounds = (left, top, right - left, bottom - top)
+
+            self.logger.info(f"Manual grid crop: top={top}, bottom={bottom}, left={left}, right={right}")
+
+            return cropped, bounds
 
         except Exception as e:
-            self.logger.exception("Error cropping the grid region.")
+            self.logger.exception("Error in manual grid cropping.")
             raise GridDetectionError("Grid region could not be determined.")
 
-    def detect_circles_in_cell(self, cell_gray, cell_thresh):
-        """Detect circles (answer options) within a cell using HoughCircles"""
+    def detect_bubbles_in_cell(self, cell_image, dark_mask_cell):
+        """Detect and analyze bubbles within a single cell"""
+        bubbles = []
+
+        # Use HoughCircles to detect circular shapes
         circles = cv2.HoughCircles(
-            cell_gray,
+            cell_image,
             cv2.HOUGH_GRADIENT,
             dp=1,
-            minDist=int(cell_gray.shape[1] / 6),  # Minimum distance between circles
-            param1=50,
-            param2=20,
-            minRadius=int(min(cell_gray.shape) / 15),
-            maxRadius=int(min(cell_gray.shape) / 8)
+            minDist=int(cell_image.shape[1] / 6),
+            param1=40,
+            param2=25,
+            minRadius=max(5, int(min(cell_image.shape) / 20)),
+            maxRadius=int(min(cell_image.shape) / 6)
         )
 
-        detected_circles = []
         if circles is not None:
             circles = np.round(circles[0, :]).astype("int")
-            # Sort circles by x coordinate (left to right)
+            # Sort by x-coordinate (left to right)
             circles = sorted(circles, key=lambda c: c[0])
-            detected_circles = circles[:self.options]  # Take only the expected number
 
-        return detected_circles
+            for i, (x, y, r) in enumerate(circles[:self.options]):
+                # Check if this bubble is filled using dark mask
+                mask = np.zeros(cell_image.shape, dtype=np.uint8)
+                cv2.circle(mask, (x, y), r, 255, -1)
 
-    def analyze_circle_filling(self, cell_gray, circle):
-        """Analyze if a circle is filled/marked"""
-        x, y, r = circle
+                # Check dark filling
+                dark_pixels = cv2.bitwise_and(dark_mask_cell, dark_mask_cell, mask=mask)
+                dark_ratio = np.sum(dark_pixels > 0) / np.sum(mask > 0)
 
-        # Create a mask for the circle
-        mask = np.zeros(cell_gray.shape[:2], dtype=np.uint8)
-        cv2.circle(mask, (x, y), r, 255, -1)
+                # Check grayscale intensity
+                circle_pixels = cell_image[mask > 0]
+                mean_intensity = np.mean(circle_pixels) if len(circle_pixels) > 0 else 255
 
-        # Extract the circular region
-        circle_region = cv2.bitwise_and(cell_gray, cell_gray, mask=mask)
-        circle_pixels = circle_region[mask > 0]
+                # Combine dark detection and intensity analysis
+                is_filled = dark_ratio > self.dark_pixel_ratio_threshold or mean_intensity < self.dark_intensity_threshold
+                confidence = dark_ratio * 2 + (255 - mean_intensity) / 255
 
-        if len(circle_pixels) == 0:
-            return False, 0
+                bubbles.append({
+                    'option': i + 1,
+                    'position': (x, y, r),
+                    'is_filled': is_filled,
+                    'confidence': confidence,
+                    'dark_ratio': dark_ratio,
+                    'mean_intensity': mean_intensity
+                })
 
-        # Calculate statistics
-        mean_intensity = np.mean(circle_pixels)
-        std_intensity = np.std(circle_pixels)
-        min_intensity = np.min(circle_pixels)
+        # If no circles detected, use grid-based approach
+        if not bubbles:
+            bubbles = self.fallback_grid_analysis(cell_image, dark_mask_cell)
 
-        # Also check for edge pixels (crosses or heavy marks)
-        edges = cv2.Canny(circle_region, 50, 150)
-        edge_pixels = np.sum(edges[mask > 0] > 0)
-        edge_ratio = edge_pixels / len(circle_pixels)
+        return bubbles
 
-        # Multiple criteria for marking detection
-        is_filled = (
-                mean_intensity < 180 or  # Dark filling
-                min_intensity < 100 or  # Very dark spots
-                edge_ratio > 0.1  # Significant edges (crosses)
-        )
+    def fallback_grid_analysis(self, cell_image, dark_mask_cell):
+        """Fallback method when circle detection fails"""
+        bubbles = []
+        cell_width = cell_image.shape[1]
+        option_width = cell_width // self.options
 
-        confidence = 0
-        if mean_intensity < 150:
-            confidence += 0.4
-        if min_intensity < 80:
-            confidence += 0.3
-        if edge_ratio > 0.15:
-            confidence += 0.3
-        if std_intensity > 30:  # High variance suggests marking
-            confidence += 0.2
+        for i in range(self.options):
+            x_start = i * option_width
+            x_end = min(x_start + option_width, cell_width)
 
-        return is_filled, confidence
+            option_region = cell_image[:, x_start:x_end]
+            dark_region = dark_mask_cell[:, x_start:x_end]
 
-    def extract_answers(self, cropped_img):
+            if option_region.size > 0:
+                mean_intensity = np.mean(option_region)
+                dark_ratio = np.sum(dark_region > 0) / dark_region.size
+
+                is_filled = dark_ratio > self.dark_pixel_ratio_threshold or mean_intensity < self.dark_intensity_threshold
+                confidence = dark_ratio * 1.5 + (255 - mean_intensity) / 255
+
+                bubbles.append({
+                    'option': i + 1,
+                    'position': (x_start + option_width // 2, cell_image.shape[0] // 2, option_width // 4),
+                    'is_filled': is_filled,
+                    'confidence': confidence,
+                    'dark_ratio': dark_ratio,
+                    'mean_intensity': mean_intensity
+                })
+
+        return bubbles
+
+    def extract_answers_v3(self, grid_image, dark_mask, grid_bounds):
+        """Enhanced answer extraction with better cell detection"""
         try:
             answers = []
-            h, w = cropped_img.shape
-            cell_h = h // self.rows
-            col_w = w // self.cols
+            h, w = grid_image.shape
 
-            if cell_h == 0 or col_w == 0:
-                raise AnswerExtractionError("Grid dimensions too small to extract answers.")
+            # Calculate cell dimensions
+            cell_height = h // self.rows
+            cell_width = w // self.cols
 
-            # Use adaptive thresholding for better results
-            thresh_img = cv2.adaptiveThreshold(
-                cropped_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV, 11, 2
-            )
+            if cell_height < 20 or cell_width < 50:
+                raise AnswerExtractionError("Grid cells too small for reliable detection.")
 
-            # Save debug image
-            debug_path = f"{Config.LOG_DIR}/debug_thresh.png"
-            cv2.imwrite(debug_path, thresh_img)
+            self.logger.info(f"Grid dimensions: {w}x{h}, Cell size: {cell_width}x{cell_height}")
+
+            # Extract dark mask for grid region
+            x_offset, y_offset = grid_bounds[0], grid_bounds[1]
+            grid_dark_mask = dark_mask[y_offset:y_offset + h, x_offset:x_offset + w]
 
             question_num = 1
+
             for col in range(self.cols):
                 for row in range(self.rows):
                     if question_num > self.total_questions:
                         break
 
-                    y = row * cell_h
-                    x = col * col_w
+                    # Calculate cell boundaries with small margins
+                    y1 = row * cell_height + 2
+                    y2 = (row + 1) * cell_height - 2
+                    x1 = col * cell_width + 2
+                    x2 = (col + 1) * cell_width - 2
 
-                    cell_gray = cropped_img[y:y + cell_h, x:x + col_w]
-                    cell_thresh = thresh_img[y:y + cell_h, x:x + col_w]
+                    # Extract cell
+                    cell_image = grid_image[y1:y2, x1:x2]
+                    cell_dark_mask = grid_dark_mask[y1:y2, x1:x2] if grid_dark_mask.shape == grid_image.shape else np.zeros_like(cell_image)
 
-                    if cell_gray.size == 0:
+                    if cell_image.size == 0:
                         answers.append(None)
                         question_num += 1
                         continue
 
-                    # Try to detect circles automatically
-                    circles = self.detect_circles_in_cell(cell_gray, cell_thresh)
+                    # Detect bubbles in this cell
+                    bubbles = self.detect_bubbles_in_cell(cell_image, cell_dark_mask)
 
-                    if len(circles) >= self.options:
-                        # Use detected circles
-                        option_results = []
-                        for i, circle in enumerate(circles[:self.options]):
-                            is_filled, confidence = self.analyze_circle_filling(cell_gray, circle)
-                            option_results.append((i + 1, is_filled, confidence))
+                    # Determine the answer
+                    filled_bubbles = [b for b in bubbles if b['is_filled']]
+
+                    if len(filled_bubbles) == 1:
+                        answer = filled_bubbles[0]['option']
+                        confidence = filled_bubbles[0]['confidence']
+                        self.logger.debug(f"Q{question_num}: Single answer {answer} (conf: {confidence:.2f})")
+
+                    elif len(filled_bubbles) > 1:
+                        # Multiple answers - choose highest confidence
+                        best_bubble = max(filled_bubbles, key=lambda x: x['confidence'])
+                        answer = best_bubble['option']
+                        self.logger.warning(f"Q{question_num}: Multiple answers detected, chose {answer}")
+
                     else:
-                        # Fall back to grid-based analysis
-                        option_results = []
-                        opt_w = col_w // self.options
-
-                        for opt in range(self.options):
-                            opt_x = opt * opt_w
-                            opt_gray = cell_gray[:, opt_x:opt_x + opt_w]
-
-                            if opt_gray.size == 0:
-                                option_results.append((opt + 1, False, 0))
-                                continue
-
-                            # Simple analysis for fallback
-                            mean_intensity = np.mean(opt_gray)
-                            min_intensity = np.min(opt_gray)
-
-                            is_filled = mean_intensity < 180 or min_intensity < 100
-                            confidence = (200 - mean_intensity) / 200 if is_filled else 0
-
-                            option_results.append((opt + 1, is_filled, confidence))
-
-                    # Determine the answer based on confidence scores
-                    filled_options = [(opt, conf) for opt, filled, conf in option_results if filled]
-
-                    if len(filled_options) == 1:
-                        # Only one option marked - ideal case
-                        answer = filled_options[0][0]
-                        self.logger.debug(f"Question {question_num}: Single option detected -> Answer: {answer}")
-                    elif len(filled_options) > 1:
-                        # Multiple options marked - choose the one with highest confidence
-                        answer = max(filled_options, key=lambda x: x[1])[0]
-                        filled_answers = [opt for opt, _ in filled_options]
-                        self.logger.warning(
-                            f"Question {question_num}: Multiple options detected {filled_answers}, chose highest confidence -> Answer: {answer}")
-                    else:
-                        # No option marked
-                        answer = None
-                        self.logger.debug(f"Question {question_num}: No option detected -> Answer: None")
+                        # No clear answer
+                        # Check if any bubble has moderate confidence
+                        moderate_bubbles = [b for b in bubbles if b['confidence'] > 0.3]
+                        if moderate_bubbles:
+                            best_bubble = max(moderate_bubbles, key=lambda x: x['confidence'])
+                            answer = best_bubble['option']
+                            self.logger.debug(f"Q{question_num}: Moderate confidence answer {answer}")
+                        else:
+                            answer = None
+                            self.logger.debug(f"Q{question_num}: No answer detected")
 
                     answers.append(answer)
 
-                    # Enhanced debug logging for all questions
+                    # Debug logging
                     if self.logger.isEnabledFor(logging.DEBUG):
-                        confidence_info = [(opt, f"{conf:.2f}" if conf > 0 else "0.00") for opt, filled, conf in
-                                           option_results if filled]
-                        self.logger.debug(
-                            f"Q{question_num}: Filled options with confidence: {confidence_info} -> Final Answer: {answer}")
+                        bubble_info = [(b['option'], f"D:{b['dark_ratio']:.2f}", f"I:{b['mean_intensity']:.0f}",
+                                      f"C:{b['confidence']:.2f}") for b in bubbles if b['is_filled']]
+                        self.logger.debug(f"Q{question_num}: Filled bubbles: {bubble_info} -> Answer: {answer}")
 
                     question_num += 1
 
@@ -296,29 +337,43 @@ class MCQAnswerDetectorV2:
             self.logger.exception("Error extracting answers from the sheet.")
             raise AnswerExtractionError(str(e))
 
-    def validate_answers(self, answers):
+    def validate_answers_v3(self, answers):
+        """Enhanced answer validation with more detailed reporting"""
         try:
             answered = len([a for a in answers if a is not None])
             unanswered = self.total_questions - answered
             formatted = {i + 1: ans for i, ans in enumerate(answers) if ans is not None}
 
-            self.logger.info(f"Answered: {answered}, Unanswered: {unanswered}")
+            # Option distribution
+            option_counts = {i: 0 for i in range(1, self.options + 1)}
+            for ans in answers:
+                if ans is not None and 1 <= ans <= self.options:
+                    option_counts[ans] += 1
 
-            # Additional validation and detailed answer logging
-            option_counts = {i: 0 for i in range(1, 6)}
-            answer_details = []
+            # Detailed logging
+            self.logger.info(
+                f"Detection Results: {answered}/{self.total_questions} answered ({answered / self.total_questions * 100:.1f}%)")
 
-            for i, ans in enumerate(answers):
-                if ans is not None:
-                    option_counts[ans] = option_counts.get(ans, 0) + 1
-                    answer_details.append(f"Q{i + 1}:{ans}")
-
-            # Log all detected answers in groups of 10 for readability
-            for i in range(0, len(answer_details), 10):
-                group = answer_details[i:i + 10]
-                self.logger.info(f"Answers {i + 1}-{min(i + 10, len(answer_details))}: {' '.join(group)}")
+            # Log answers in groups for better readability
+            for i in range(0, len(answers), 10):
+                end_idx = min(i + 10, len(answers))
+                answer_group = []
+                for j in range(i, end_idx):
+                    ans = answers[j] if answers[j] is not None else 'X'
+                    answer_group.append(f"Q{j + 1}:{ans}")
+                self.logger.info(f"Answers {i + 1}-{end_idx}: {' '.join(answer_group)}")
 
             self.logger.info(f"Option distribution: {option_counts}")
+
+            # Quality checks
+            if answered < self.total_questions * 0.5:
+                self.logger.warning("Low detection rate - less than 50% of questions detected")
+
+            # Check for unusual patterns
+            dominant_option = max(option_counts, key=option_counts.get)
+            if option_counts[dominant_option] > self.total_questions * 0.6:
+                self.logger.warning(
+                    f"Unusual pattern: Option {dominant_option} dominates with {option_counts[dominant_option]} selections")
 
             return {
                 "answers": formatted,
@@ -326,7 +381,8 @@ class MCQAnswerDetectorV2:
                 "answered": answered,
                 "unanswered": unanswered,
                 "raw": answers,
-                "option_distribution": option_counts
+                "option_distribution": option_counts,
+                "detection_rate": answered / self.total_questions
             }
 
         except Exception as e:
@@ -334,26 +390,76 @@ class MCQAnswerDetectorV2:
             raise MCQDetectorError("Answer validation failed.")
 
     def process_image(self, image_path):
-        """Main method to process an MCQ image and extract answers"""
+        """Main processing method with enhanced pipeline"""
         try:
             # Preprocess image
-            original, gray, processed = self.preprocess_image(image_path)
+            original, gray, processed, _ = self.preprocess_image(image_path)  # No longer using HSV
 
-            # Detect grid region
-            grid_region = self.detect_grid_automatically(processed)
+            # Detect dark regions (filled bubbles)
+            dark_mask = self.detect_dark_regions(processed)
 
-            # Save cropped grid for debugging
-            debug_path = f"{Config.LOG_DIR}/debug_grid.png"
+            # Detect grid region more precisely
+            grid_region, grid_bounds = self.detect_grid_region_precise(processed, original)
+
+            # Save debug images
+            debug_path = f"{Config.LOG_DIR}/debug_grid_v3.png"
             cv2.imwrite(debug_path, grid_region)
 
-            # Extract answers
-            answers = self.extract_answers(grid_region)
+            # Extract answers using enhanced method
+            answers = self.extract_answers_v3(grid_region, dark_mask, grid_bounds)
 
             # Validate and format results
-            results = self.validate_answers(answers)
+            results = self.validate_answers_v3(answers)
 
             return results
 
         except Exception as e:
             self.logger.exception("Error processing MCQ image.")
             raise MCQDetectorError(f"Failed to process image: {str(e)}")
+
+    def debug_cell_analysis(self, image_path, question_num):
+        """Debug method to analyze a specific question cell in detail"""
+        try:
+            original, gray, processed, _ = self.preprocess_image(image_path)
+            dark_mask = self.detect_dark_regions(processed)
+            grid_region, grid_bounds = self.detect_grid_region_precise(processed, original)
+
+            h, w = grid_region.shape
+            cell_height = h // self.rows
+            cell_width = w // self.cols
+
+            # Calculate which cell contains the question
+            col = (question_num - 1) // self.rows
+            row = (question_num - 1) % self.rows
+
+            y1 = row * cell_height + 2
+            y2 = (row + 1) * cell_height - 2
+            x1 = col * cell_width + 2
+            x2 = (col + 1) * cell_width - 2
+
+            cell_image = grid_region[y1:y2, x1:x2]
+            x_offset, y_offset = grid_bounds[0], grid_bounds[1]
+            grid_dark_mask = dark_mask[y_offset:y_offset + h, x_offset:x_offset + w]
+            cell_dark_mask = grid_dark_mask[y1:y2, x1:x2]
+
+            # Analyze the cell
+            bubbles = self.detect_bubbles_in_cell(cell_image, cell_dark_mask)
+
+            # Save debug images
+            debug_cell_path = f"{Config.LOG_DIR}/debug_cell_q{question_num}.png"
+            debug_dark_path = f"{Config.LOG_DIR}/debug_cell_q{question_num}_dark.png"
+
+            cv2.imwrite(debug_cell_path, cell_image)
+            cv2.imwrite(debug_dark_path, cell_dark_mask)
+
+            self.logger.info(f"Question {question_num} debug analysis:")
+            for bubble in bubbles:
+                self.logger.info(f"  Option {bubble['option']}: Filled={bubble['is_filled']}, "
+                               f"Confidence={bubble['confidence']:.2f}, DarkRatio={bubble['dark_ratio']:.2f}, "
+                               f"Intensity={bubble['mean_intensity']:.1f}")
+
+            return bubbles
+
+        except Exception as e:
+            self.logger.exception(f"Error in debug analysis for question {question_num}")
+            return []

@@ -5,17 +5,58 @@ import shutil
 from configs.logger import setup_logger
 from detector.processor import MCQAnswerDetector
 from detector.processorv2 import MCQAnswerDetectorV2
+from detector.processorv3 import MCQAnswerDetectorV3
 from exceptions.exceptions import MCQDetectorError
 
 router = APIRouter()
 logger = setup_logger()
 processor = MCQAnswerDetector(logger)
 processor2 = MCQAnswerDetectorV2(logger)
+processor3 = MCQAnswerDetectorV3(logger)
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-@router.post("/analyze")
+# @router.post("/analyze")
+# async def analyze_image(file: UploadFile = File(...)):
+#     try:
+#         # Save uploaded image to disk
+#         file_path = os.path.join(UPLOAD_DIR, file.filename)
+#         with open(file_path, "wb") as buffer:
+#             shutil.copyfileobj(file.file, buffer)
+#
+#         logger.info(f"Received file: {file.filename}")
+#         original, gray, _ = processor.preprocess_image(file_path)
+#         cropped = processor.get_grid_region(gray)
+#         answers = processor.extract_answers(cropped)
+#         result = processor.validate_answers(answers)
+#
+#         # Build pretty printed result string
+#         output_lines = ["ANSWER SHEET RESULTS", "=" * 50]
+#         for q in range(1, result["total"] + 1):
+#             ans = result["answers"].get(q, "-")
+#             output_lines.append(f"Q{q:2d}: {ans}")
+#             if q % 10 == 0:
+#                 output_lines.append("")
+#         pretty_output = "\n".join(output_lines)
+#
+#         return JSONResponse({
+#             "status": "success",
+#             "answers": result["answers"],
+#             "answered": result["answered"],
+#             "unanswered": result["unanswered"],
+#             "total_questions": result["total"]
+#         })
+#
+#     except MCQDetectorError as e:
+#         logger.error(f"[MCQ Error] {e}")
+#         return JSONResponse(status_code=400, content={"error": str(e)})
+#
+#     except Exception as e:
+#         logger.exception("Unexpected error occurred.")
+#         return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+@router.post("/v2/analyze")
 async def analyze_image(file: UploadFile = File(...)):
     try:
         # Save uploaded image to disk
@@ -23,11 +64,7 @@ async def analyze_image(file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        logger.info(f"Received file: {file.filename}")
-        original, gray, _ = processor.preprocess_image(file_path)
-        cropped = processor.get_grid_region(gray)
-        answers = processor.extract_answers(cropped)
-        result = processor.validate_answers(answers)
+        result = processor2.process_image(file_path)
 
         # Build pretty printed result string
         output_lines = ["ANSWER SHEET RESULTS", "=" * 50]
@@ -54,10 +91,11 @@ async def analyze_image(file: UploadFile = File(...)):
         logger.exception("Unexpected error occurred.")
         return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
-@router.post("/v2/analyze")
+
+@router.post("/v3/analyze")
 async def analyze_image():
-    processor2.process_image("test.jpg")
-    
+    processor3.process_image("answer_sheet.png")
+
 @router.delete("/clear-uploads")
 async def clear_uploads():
     try:
